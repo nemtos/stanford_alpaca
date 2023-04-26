@@ -7,6 +7,7 @@
 
 [![Code License](https://img.shields.io/badge/Code%20License-Apache_2.0-green.svg)](https://github.com/tatsu-lab/stanford_alpaca/blob/main/LICENSE)
 [![Data License](https://img.shields.io/badge/Data%20License-CC%20By%20NC%204.0-red.svg)](https://github.com/tatsu-lab/stanford_alpaca/blob/main/DATA_LICENSE)
+[![Weight Diff License](https://img.shields.io/badge/Weight%20Diff%20License-CC%20By%20NC%204.0-yellow)](https://github.com/tatsu-lab/stanford_alpaca/blob/main/WEIGHT_DIFF_LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
@@ -15,10 +16,12 @@ This is the repo for the Stanford Alpaca project, which aims to build and share 
 - The [52K data](#data-release) used for fine-tuning the model.
 - The code for [generating the data](#data-generation-process).
 - The code for [fine-tuning the model](#fine-tuning).
+- The code for [recovering Alpaca-7B weights from our released weight diff](#recovering-alpaca-weights).
 
 Note: We thank the community for feedback on Stanford-Alpaca and supporting our research. Our live demo is suspended until further notice.
 
-**Usage and License Notices**: Alpaca is intended and licensed for research use only. The dataset is CC BY NC 4.0 (allowing only non-commercial use) and models trained using the dataset should not be used outside of research purposes.
+**Usage and License Notices**: Alpaca is intended and licensed for research use only. The dataset is CC BY NC 4.0 (allowing only non-commercial use) and models trained using the dataset should not be used outside of research purposes. 
+The weight diff is also CC BY NC 4.0 (allowing only non-commercial use).
 
 ## Overview
 
@@ -104,26 +107,22 @@ The inner circle of the plot represents the root verb of the instructions, and t
 
 ## Fine-tuning
 
-We fine-tune our models using standard Hugging Face training code with the following hyperparameters:
+We fine-tune our models using standard Hugging Face training code.
+We fine-tune LLaMA-7B and LLaMA-13B with the following hyperparameters:
 
-| Hyperparameter | Value |
-|----------------|-------|
-| Batch size     | 128   |
-| Learning rate  | 2e-5  |
-| Epochs         | 3     |
-| Max length     | 512   |
- | Weight decay   | 0     |
-
-Given Hugging Face hasn't officially supported the LLaMA models, we fine-tuned LLaMA with Hugging Face's transformers library by installing it from a particular fork (i.e. this [PR](https://github.com/huggingface/transformers/pull/21955) to be merged).
-The hash of the specific commit we installed was `68d640f7c368bcaaaecfc678f11908ebbd3d6176`.
+| Hyperparameter | LLaMA-7B | LLaMA-13B |
+|----------------|----------|-----------|
+| Batch size     | 128      | 128       |
+| Learning rate  | 2e-5     | 1e-5      |
+| Epochs         | 3        | 5         |
+| Max length     | 512      | 512       |
+| Weight decay   | 0        | 0         |
 
 To reproduce our fine-tuning runs for LLaMA, first install the requirements
 
 ```bash
 pip install -r requirements.txt
 ```
-
-Then, install the particular fork of Hugging Face's transformers library.
 
 Below is a command that fine-tunes LLaMA-7B with our dataset on a machine with 4 A100 80G GPUs in FSDP `full_shard` mode.
 We were able to reproduce a model of similar quality as the one we hosted in our demo with the following command using **Python 3.10**.
@@ -150,19 +149,9 @@ torchrun --nproc_per_node=4 --master_port=<your_random_port> train.py \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --fsdp "full_shard auto_wrap" \
-    --fsdp_transformer_layer_cls_to_wrap 'LLaMADecoderLayer' \
+    --fsdp_transformer_layer_cls_to_wrap 'LlamaDecoderLayer' \
     --tf32 True
 ```
-
-### Warning
-
-`fsdp_transformer_layer_cls_to_wrap` must be set to the name of the specific decoder layer.
-The LLaMA Hugging Face PR is not stable.
-Earlier commits used the name `LLaMADecoderLayer` for their decoder layer (the commit hash our code is based on this).
-More recent commits use `LlamaDecoderLayer` (notice the small case difference).
-Not setting `fsdp_transformer_layer_cls_to_wrap` to the correct name will lead to drastic slowdowns in training.
-
-### Side notes
 
 The same script also works for OPT fine-tuning. Here's an example for fine-tuning OPT-6.7B
 
@@ -192,6 +181,58 @@ torchrun --nproc_per_node=4 --master_port=<your_random_port> train.py \
 
 Note the given training script is meant to be simple and easy to use, and is not particularly optimized.
 To run on more gpus, you may prefer to turn down `gradient_accumulation_steps` to keep a global batch size of 128. Global batch size has not been tested for optimality.
+
+### Addressing OOM
+
+Naively, fine-tuning a 7B model requires about 7 x 4 x 4 = 112 GB of VRAM. Commands given above enable parameter sharding, so no redundant model copy is stored on any GPU.
+If you'd like to further reduce the memory footprint, here are some options:
+
+- Turn on CPU offload for FSDP with `--fsdp "full_shard auto_wrap offload"`. This saves VRAM at the cost of longer runtime.
+- In our experience, DeepSpeed stage-3 (with offload) can at times be more memory efficient than FSDP with offload. Here's an example to use DeepSpeed stage-3 with 4 GPUs with both parameter and optimizer offload:
+    ```bash
+    pip install deepspeed
+    torchrun --nproc_per_node=4 --master_port=<your_random_port> train.py \
+        --model_name_or_path <your_path_to_hf_converted_llama_ckpt_and_tokenizer> \
+        --data_path ./alpaca_data.json \
+        --bf16 True \
+        --output_dir <your_output_dir> \
+        --num_train_epochs 3 \
+        --per_device_train_batch_size 4 \
+        --per_device_eval_batch_size 4 \
+        --gradient_accumulation_steps 8 \
+        --evaluation_strategy "no" \
+        --save_strategy "steps" \
+        --save_steps 2000 \
+        --save_total_limit 1 \
+        --learning_rate 2e-5 \
+        --weight_decay 0. \
+        --warmup_ratio 0.03 \
+        --deepspeed "./configs/default_offload_opt_param.json" \
+        --tf32 True
+    ```
+  - The DeepSpeed library also provides some [helpful functions](https://deepspeed.readthedocs.io/en/latest/memory.html) to estimate memory usage. 
+- [LoRA](https://arxiv.org/abs/2106.09685) fine-tunes low-rank slices of the query, key, and value embedding heads. This can reduce the total memory footprint from 112GB to about 7x4=28GB. We may release our re-implemention of this in the future, but for now the [peft](https://github.com/huggingface/peft) codebase can be a useful resource.
+
+## Recovering Alpaca Weights
+
+The weight diff between Alpaca-7B and LLaMA-7B is located [here](https://huggingface.co/tatsu-lab/alpaca-7b-wdiff/tree/main).
+To recover the original Alpaca-7B weights, follow these steps:
+```text
+1. Convert Meta's released weights into huggingface format. Follow this guide:
+    https://huggingface.co/docs/transformers/main/model_doc/llama
+2. Make sure you cloned the released weight diff into your local machine. The weight diff is located at:
+    https://huggingface.co/tatsu-lab/alpaca-7b/tree/main
+3. Run this function with the correct paths. E.g.,
+    python weight_diff.py recover --path_raw <path_to_step_1_dir> --path_diff <path_to_step_2_dir> --path_tuned <path_to_store_recovered_weights>
+```
+
+Once step 3 completes, you should have a directory with the recovered weights, from which you can load the model like the following
+
+```python
+import transformers
+alpaca_model = transformers.AutoModelForCausalLM.from_pretrained("<path_to_store_recovered_weights>")
+alpaca_tokenizer = transformers.AutoTokenizer.from_pretrained("<path_to_store_recovered_weights>")
+```
 
 ### Authors
 
